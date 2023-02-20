@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 # hyperparameters
 batch_size = 32 # how many independent sequences to process in parallel
-block_size = 8 # what is the maximum context length for predictions?
+block_size = 256 # what is the maximum context length for predictions?
 max_iters = 5000 # how many training iterations to run
 eval_interval = 500 # how often to evaluate the model on the validation set
 learning_rate = 1e-3 # how fast should the model learn?
@@ -66,6 +66,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(0.1)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x) # B, T, C
@@ -76,6 +78,7 @@ class Head(nn.Module):
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         # apply softmax to get the attention weights
         wei = wei.softmax(dim=-1) # B, T, T
+        wei = self.dropout(wei)
         # apply the attention weights to the values
         v = self.value(x) # B, T, C
         return wei @ v # B, T, C
@@ -87,9 +90,47 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.projection = nn.Linear(num_heads * head_size, n_embd)
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.projection(out))
+        return out
+
+class FeedForward(nn.Module):
+    """ simple feed-forward network with ReLU activation """
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation """
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa_head = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        # also add layer normalization - just like batch norm but over rows not columns
+        self.ln1 = nn.LayerNorm(n_embd) 
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        # also add residual connections to control the flow of gradients
+        # communication
+        x = x + self.sa_head(self.ln1(x)) # this is a departure from the original paper, this is known as the pre norm formulation
+        # computation
+        x = x + self.ffwd(self.ln2(x))
+        return x
 
 class TransformerLanguageModel(nn.Module):
     """
@@ -101,7 +142,15 @@ class TransformerLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         # positional embedding
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_head = MultiHeadAttention(4, n_embd // 4)
+        self.blocks = nn.Sequential(
+            Block(n_embd, 4),
+            Block(n_embd, 4),
+            Block(n_embd, 4),
+            Block(n_embd, 4),
+            Block(n_embd, 4),
+            Block(n_embd, 4),
+            nn.LayerNorm(n_embd)
+        )
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -111,7 +160,7 @@ class TransformerLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # B, T, C
         pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) # 1, T, C
         x = tok_emb + pos_emb # B, T, C
-        x = self.sa_head(x) # B, T, C (only one for now)
+        x = self.blocks(x) # B, T, C
         logits = self.lm_head(x) # B, T, vocab_size
 
         if targets is not None:
@@ -158,9 +207,6 @@ for iter in range(max_iters):
 
     # sample a batch of data
     xb, yb = get_batch('train')
-
-    print(xb.shape, yb.shape)
-    break
     # evaluate the loss
     logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
